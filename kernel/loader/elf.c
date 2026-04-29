@@ -184,8 +184,7 @@ int elf_load_at(const void *data, size_t size, uint64_t load_base,
       return -1;
     }
 
-    /* For PIE, add load_base to vaddr */
-    uint64_t dest_addr = is_pie ? (load_base + phdr->p_vaddr) : phdr->p_vaddr;
+    uint64_t dest_addr = load_base + phdr->p_vaddr;
 
     void *dest = (void *)dest_addr;
     const void *src = base + phdr->p_offset;
@@ -212,7 +211,7 @@ int elf_load_at(const void *data, size_t size, uint64_t load_base,
   }
 
   /* Calculate entry point */
-  uint64_t entry = is_pie ? (load_base + ehdr->e_entry) : ehdr->e_entry;
+  uint64_t entry = load_base + ehdr->e_entry;
 
   printk(KERN_INFO "[ELF] Entry point: 0x%llx\n", (unsigned long long)entry);
 

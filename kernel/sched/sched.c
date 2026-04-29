@@ -3,6 +3,7 @@
  */
 
 #include "sched/sched.h"
+#include "fs/vfs.h"
 #include "mm/pmm.h"
 #include "printk.h"
 
@@ -17,6 +18,9 @@ static struct rq runqueue;
 #define MAX_TASKS   256
 static struct task_struct task_pool[MAX_TASKS];
 static int task_pool_index = 0;
+
+static struct files_struct files_pool[MAX_TASKS + 1];
+static int files_pool_index = 0;
 
 /* PID counter */
 static pid_t next_pid = 1;
@@ -68,6 +72,93 @@ static void *alloc_stack(size_t size)
     }
     
     return (void *)paddr;  /* Identity mapped for now */
+}
+
+static struct files_struct *alloc_files(void)
+{
+    if (files_pool_index >= MAX_TASKS + 1) {
+        return NULL;
+    }
+
+    struct files_struct *files = &files_pool[files_pool_index++];
+    for (size_t i = 0; i < sizeof(*files); i++) {
+        ((char *)files)[i] = 0;
+    }
+
+    atomic_set(&files->users, 1);
+    files->fd[0].in_use = 1;
+    files->fd[1].in_use = 1;
+    files->fd[2].in_use = 1;
+
+    return files;
+}
+
+int task_init_files(struct task_struct *task)
+{
+    if (!task) {
+        return -1;
+    }
+    if (task->files) {
+        return 0;
+    }
+
+    task->files = alloc_files();
+    return task->files ? 0 : -1;
+}
+
+int task_copy_files(struct task_struct *child, struct task_struct *parent,
+                    uint32_t clone_flags)
+{
+    if (!child) {
+        return -1;
+    }
+
+    if (!parent || !parent->files) {
+        return task_init_files(child);
+    }
+
+    if (clone_flags & CLONE_FILES) {
+        child->files = parent->files;
+        atomic_inc(&child->files->users);
+        return 0;
+    }
+
+    child->files = alloc_files();
+    if (!child->files) {
+        return -1;
+    }
+
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        child->files->fd[i] = parent->files->fd[i];
+        if (child->files->fd[i].in_use && child->files->fd[i].file) {
+            atomic_inc(&child->files->fd[i].file->f_count);
+        }
+    }
+
+    return 0;
+}
+
+void task_release_files(struct task_struct *task)
+{
+    if (!task || !task->files) {
+        return;
+    }
+
+    struct files_struct *files = task->files;
+    task->files = NULL;
+
+    if (!atomic_dec_and_test(&files->users)) {
+        return;
+    }
+
+    for (int i = 3; i < TASK_MAX_FDS; i++) {
+        if (files->fd[i].in_use && files->fd[i].file) {
+            vfs_close(files->fd[i].file);
+        }
+        files->fd[i].file = NULL;
+        files->fd[i].flags = 0;
+        files->fd[i].in_use = 0;
+    }
 }
 
 static void enqueue_task(struct task_struct *task)
@@ -136,6 +227,7 @@ void sched_init(void)
     runqueue.tail = NULL;
     runqueue.nr_running = 0;
     runqueue.clock = 0;
+    task_init_files(&init_task);
     
     printk(KERN_INFO "SCHED: Scheduler initialized\n");
 }
@@ -210,6 +302,10 @@ struct task_struct *create_task(void (*entry)(void *), void *arg, uint32_t flags
     task->stack = stack;
     task->stack_size = KERNEL_STACK_SIZE;
     task->parent = runqueue.current;
+    if (task_init_files(task) < 0) {
+        printk(KERN_ERR "SCHED: Failed to allocate file table\n");
+        return NULL;
+    }
     
     /* Set up initial CPU context */
     task->cpu_context.sp = (uint64_t)stack + KERNEL_STACK_SIZE;
@@ -239,6 +335,7 @@ void exit_task(int code)
     current->exit_code = code;
     current->state = TASK_ZOMBIE;
     current->flags |= PF_EXITING;
+    task_release_files(current);
     
     /* Remove from run queue */
     dequeue_task(current);
@@ -284,6 +381,10 @@ pid_t create_thread(void (*entry)(void *), void *arg, void *stack, uint32_t clon
     task->parent = parent;
     task->uid = parent->uid;
     task->gid = parent->gid;
+    if (task_copy_files(task, parent, clone_flags) < 0) {
+        printk(KERN_ERR "SCHED: Failed to allocate thread file table\n");
+        return -1;
+    }
     
     /* Copy name with " [thread]" suffix */
     int i;

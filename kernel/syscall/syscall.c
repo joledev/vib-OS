@@ -15,42 +15,41 @@
 /* File Descriptor Table */
 /* ===================================================================== */
 
-#define MAX_FDS 256
-
-/* File descriptor entry */
-struct fd_entry {
-  struct file *file;
-  int flags;
-  int in_use;
-};
-
-/* Global FD table (per-process would be better, but simpler for now) */
-static struct fd_entry fd_table[MAX_FDS];
-static int fd_table_initialized = 0;
-
-static void init_fd_table(void) {
-  if (fd_table_initialized)
-    return;
-
-  for (int i = 0; i < MAX_FDS; i++) {
-    fd_table[i].file = NULL;
-    fd_table[i].flags = 0;
-    fd_table[i].in_use = 0;
+static struct files_struct *current_files(void) {
+  struct task_struct *current = get_current();
+  if (!current) {
+    return NULL;
   }
+  if (!current->files && task_init_files(current) < 0) {
+    return NULL;
+  }
+  return current->files;
+}
 
-  /* Reserve stdin/stdout/stderr */
-  fd_table[0].in_use = 1; /* stdin */
-  fd_table[1].in_use = 1; /* stdout */
-  fd_table[2].in_use = 1; /* stderr */
-
-  fd_table_initialized = 1;
+static struct mm_struct *current_mm(void) {
+  struct task_struct *current = get_current();
+  if (!current) {
+    return NULL;
+  }
+  if (!current->mm) {
+    current->mm = vmm_create_address_space();
+    if (!current->mm) {
+      return NULL;
+    }
+    current->active_mm = current->mm;
+    vmm_switch_address_space(current->mm);
+  }
+  return current->mm;
 }
 
 static int alloc_fd(void) {
-  init_fd_table();
-  for (int i = 3; i < MAX_FDS; i++) {
-    if (!fd_table[i].in_use) {
-      fd_table[i].in_use = 1;
+  struct files_struct *files = current_files();
+  if (!files) {
+    return -1;
+  }
+  for (int i = 3; i < TASK_MAX_FDS; i++) {
+    if (!files->fd[i].in_use) {
+      files->fd[i].in_use = 1;
       return i;
     }
   }
@@ -58,18 +57,20 @@ static int alloc_fd(void) {
 }
 
 static void free_fd(int fd) {
-  if (fd >= 0 && fd < MAX_FDS) {
-    fd_table[fd].file = NULL;
-    fd_table[fd].flags = 0;
-    fd_table[fd].in_use = 0;
+  struct files_struct *files = current_files();
+  if (files && fd >= 0 && fd < TASK_MAX_FDS) {
+    files->fd[fd].file = NULL;
+    files->fd[fd].flags = 0;
+    files->fd[fd].in_use = 0;
   }
 }
 
 static struct file *get_file(int fd) {
-  if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].in_use) {
+  struct files_struct *files = current_files();
+  if (!files || fd < 0 || fd >= TASK_MAX_FDS || !files->fd[fd].in_use) {
     return NULL;
   }
-  return fd_table[fd].file;
+  return files->fd[fd].file;
 }
 
 /* ===================================================================== */
@@ -89,6 +90,21 @@ static int is_valid_user_ptr(uint64_t ptr, size_t len) {
   if (len > 0 && ptr > UINT64_MAX - len)
     return 0;
   uint64_t end = ptr + len;
+
+  struct task_struct *current = get_current();
+  if (current && current->mm) {
+    if (ptr >= 0x10000000UL && end <= 0x14000000UL) {
+      uint64_t pos = ptr;
+      while (pos < end) {
+        struct vm_area *vma = vmm_find_vma(current->mm, pos);
+        if (!vma) {
+          return 0;
+        }
+        pos = vma->end < end ? vma->end : end;
+      }
+      return 1;
+    }
+  }
 
   /* Allow user heap region (0x10000000 - 0x14000000) */
   if (ptr >= 0x10000000UL && end <= 0x14000000UL) {
@@ -126,8 +142,6 @@ static long sys_read(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a3,
   (void)a3;
   (void)a4;
   (void)a5;
-
-  init_fd_table();
 
   /* Validate user buffer */
   if (!is_valid_user_ptr(buf, count)) {
@@ -185,8 +199,6 @@ static long sys_write(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a3,
   (void)a4;
   (void)a5;
 
-  init_fd_table();
-
   /* Special case: stdout/stderr (fd 1 and 2) go to console */
   if (fd == 1 || fd == 2) {
     const char *str = (const char *)buf;
@@ -210,8 +222,6 @@ static long sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
   (void)a5;
   (void)dirfd; /* dirfd ignored - always use absolute paths */
 
-  init_fd_table();
-
   const char *path = (const char *)pathname;
 
   /* Allocate file descriptor */
@@ -227,8 +237,15 @@ static long sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
     return -ENOENT;
   }
 
-  fd_table[fd].file = f;
-  fd_table[fd].flags = (int)flags;
+  struct files_struct *files = current_files();
+  if (!files) {
+    vfs_close(f);
+    free_fd(fd);
+    return -EMFILE;
+  }
+
+  files->fd[fd].file = f;
+  files->fd[fd].flags = (int)flags;
 
   return fd;
 }
@@ -240,8 +257,6 @@ static long sys_close(uint64_t fd, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a3;
   (void)a4;
   (void)a5;
-
-  init_fd_table();
 
   /* Don't close stdin/stdout/stderr */
   if (fd < 3) {
@@ -264,8 +279,6 @@ static long sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
   (void)a3;
   (void)a4;
   (void)a5;
-
-  init_fd_table();
 
   struct file *f = get_file((int)fd);
   if (!f) {
@@ -366,9 +379,6 @@ static long sys_gettid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 /* Userspace heap management - dedicated region for userspace processes */
 #define USER_HEAP_START 0x10000000UL /* 256MB mark */
 #define USER_HEAP_SIZE 0x04000000UL  /* 64MB heap */
-static uint64_t user_brk_current = USER_HEAP_START;
-static uint64_t user_mmap_current =
-    USER_HEAP_START + USER_HEAP_SIZE / 2; /* mmap from middle */
 
 static long sys_brk(uint64_t brk, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
@@ -378,20 +388,40 @@ static long sys_brk(uint64_t brk, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a4;
   (void)a5;
 
+  struct mm_struct *mm = current_mm();
+  if (!mm) {
+    return -ENOMEM;
+  }
+  if (mm->start_brk == 0) {
+    mm->start_brk = USER_HEAP_START;
+    mm->brk = USER_HEAP_START;
+    mm->mmap_base = USER_HEAP_START + USER_HEAP_SIZE / 2;
+    mm->mmap_current = mm->mmap_base;
+  }
+
   /* If brk is 0 or less than start, return current brk */
   if (brk == 0 || brk < USER_HEAP_START) {
-    return user_brk_current;
+    return mm->brk;
   }
 
   /* Check bounds */
   if (brk > USER_HEAP_START + USER_HEAP_SIZE / 2) {
     /* Would overlap with mmap region */
-    return user_brk_current;
+    return mm->brk;
   }
 
-  /* Extend brk */
-  user_brk_current = brk;
-  return user_brk_current;
+  if (brk > mm->brk) {
+    uint64_t map_start = (mm->brk + 4095UL) & ~4095UL;
+    uint64_t map_end = (brk + 4095UL) & ~4095UL;
+    if (map_end > map_start &&
+        vmm_map_user_range(mm, map_start, map_end - map_start,
+                           VM_READ | VM_WRITE | VM_USER) < 0) {
+      return mm->brk;
+    }
+  }
+
+  mm->brk = brk;
+  return mm->brk;
 }
 
 static long sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
@@ -407,39 +437,70 @@ static long sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
     return -ENOSYS;
   }
 
-/* Align len to page size */
-#define PAGE_SIZE 4096UL
-  len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  if (len == 0) {
+    return -EINVAL;
+  }
+  if (len > UINT64_MAX - 4095UL) {
+    return -ENOMEM;
+  }
+
+  struct mm_struct *mm = current_mm();
+  if (!mm) {
+    return -ENOMEM;
+  }
+  if (mm->mmap_base == 0) {
+    mm->start_brk = USER_HEAP_START;
+    mm->brk = USER_HEAP_START;
+    mm->mmap_base = USER_HEAP_START + USER_HEAP_SIZE / 2;
+    mm->mmap_current = mm->mmap_base;
+  }
+
+  len = (len + 4095UL) & ~4095UL;
 
   /* Check bounds */
-  if (user_mmap_current + len > USER_HEAP_START + USER_HEAP_SIZE) {
+  if (mm->mmap_current > USER_HEAP_START + USER_HEAP_SIZE - len) {
     printk(KERN_WARNING "sys_mmap: out of memory\n");
     return -ENOMEM;
   }
 
   /* Allocate from mmap region */
-  uint64_t result = user_mmap_current;
-  user_mmap_current += len;
-
-  /* Zero the memory */
-  uint8_t *p = (uint8_t *)result;
-  for (size_t i = 0; i < len; i++)
-    p[i] = 0;
+  uint64_t result = mm->mmap_current;
+  if (vmm_map_user_range(mm, result, len, VM_READ | VM_WRITE | VM_USER) < 0) {
+    return -ENOMEM;
+  }
+  mm->mmap_current += len;
 
   return result;
 }
 
 static long sys_munmap(uint64_t addr, uint64_t len, uint64_t a2, uint64_t a3,
                        uint64_t a4, uint64_t a5) {
-  (void)addr;
-  (void)len;
   (void)a2;
   (void)a3;
   (void)a4;
   (void)a5;
 
-  /* For now, just no-op munmap - memory is not reclaimed */
-  return 0;
+  struct mm_struct *mm = current_mm();
+  if (!mm) {
+    return -ENOMEM;
+  }
+  if (len == 0) {
+    return -EINVAL;
+  }
+  if (len > UINT64_MAX - 4095UL || addr > UINT64_MAX - len) {
+    return -EINVAL;
+  }
+
+  len = (len + 4095UL) & ~4095UL;
+  addr &= ~4095UL;
+  if (addr > UINT64_MAX - len) {
+    return -EINVAL;
+  }
+  if (addr < mm->mmap_base || addr + len > USER_HEAP_START + USER_HEAP_SIZE) {
+    return -EINVAL;
+  }
+
+  return vmm_unmap_user_range(mm, addr, len);
 }
 
 static long sys_clone(uint64_t flags, uint64_t stack, uint64_t ptid,
