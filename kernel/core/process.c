@@ -20,8 +20,9 @@ extern char *strncpy(char *dst, const char *src, size_t n);
 extern size_t strlen(const char *s);
 extern void *memset(void *s, int c, size_t n);
 
-/* Fixed program load base address (after heap area at 0x42800000) */
-#define PROGRAM_LOAD_BASE 0x44000000ULL
+/* Fixed program load window, above the kernel heap and below current mappings. */
+#define PROGRAM_LOAD_BASE 0x50000000ULL
+#define PROGRAM_LOAD_END 0x78000000ULL
 
 /* Use printk instead of printf, and kmalloc/kfree instead of malloc/free */
 #define printf printk
@@ -224,6 +225,18 @@ int process_create(const char *path, int argc, char **argv) {
 
   // Align load address with ASLR randomization
   uint64_t aslr_offset = aslr_exec_offset();
+  uint64_t load_room =
+      (next_load_addr < PROGRAM_LOAD_END) ? PROGRAM_LOAD_END - next_load_addr
+                                          : 0;
+  uint64_t max_offset =
+      (load_room > prog_size + 0x400000) ? load_room - prog_size - 0x400000 : 0;
+  max_offset &= ~0xFFFFULL;
+  if (max_offset > 0) {
+    aslr_offset %= max_offset + 0x10000;
+    aslr_offset &= ~0xFFFFULL;
+  } else {
+    aslr_offset = 0;
+  }
   uint64_t load_addr = ALIGN_64K(next_load_addr + aslr_offset);
 
   // Load the ELF at this address
