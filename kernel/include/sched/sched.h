@@ -8,6 +8,8 @@
 #include "mm/vmm.h"
 #include "types.h"
 
+struct file;
+
 /* ===================================================================== */
 /* Process states */
 /* ===================================================================== */
@@ -66,6 +68,18 @@ struct list_head {
 /* ===================================================================== */
 
 #define TASK_COMM_LEN 16
+#define TASK_MAX_FDS 256
+
+struct task_fd_entry {
+  struct file *file;
+  int flags;
+  int in_use;
+};
+
+struct files_struct {
+  atomic_t users;
+  struct task_fd_entry fd[TASK_MAX_FDS];
+};
 
 struct task_struct {
   /* Scheduling info */
@@ -89,6 +103,9 @@ struct task_struct {
   /* Memory management */
   struct mm_struct *mm;        /* User address space */
   struct mm_struct *active_mm; /* Current address space */
+
+  /* File descriptors */
+  struct files_struct *files;
 
   /* Kernel stack */
   void *stack;
@@ -232,6 +249,11 @@ void exit_task(int code) __noreturn;
  * Return: Pointer to current task
  */
 struct task_struct *get_current(void);
+
+int task_init_files(struct task_struct *task);
+int task_copy_files(struct task_struct *child, struct task_struct *parent,
+                    uint32_t clone_flags);
+void task_release_files(struct task_struct *task);
 
 /**
  * context_switch - Switch to a new task

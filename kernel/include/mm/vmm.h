@@ -121,6 +121,8 @@ struct mm_struct {
     /* Heap (brk) */
     uint64_t start_brk;         /* Start of heap */
     uint64_t brk;               /* Current program break */
+    uint64_t mmap_base;         /* Start of mmap region */
+    uint64_t mmap_current;      /* Next mmap allocation */
     
     /* Stack */
     uint64_t start_stack;       /* Start of user stack */
@@ -182,6 +184,11 @@ int vmm_map_range(virt_addr_t vaddr, phys_addr_t paddr, size_t size, uint32_t fl
  * Return: 0 on success, negative on error
  */
 int vmm_unmap_range(virt_addr_t vaddr, size_t size);
+
+int vmm_map_user_range(struct mm_struct *mm, virt_addr_t vaddr, size_t size,
+                       uint32_t flags);
+int vmm_unmap_user_range(struct mm_struct *mm, virt_addr_t vaddr, size_t size);
+struct vm_area *vmm_find_vma(struct mm_struct *mm, virt_addr_t addr);
 
 /**
  * vmm_virt_to_phys - Translate virtual to physical address

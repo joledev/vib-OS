@@ -91,6 +91,11 @@ long do_fork(unsigned long flags) {
     return -1;
   }
 
+  task_release_files(child);
+  if (task_copy_files(child, current_task, (uint32_t)flags) < 0) {
+    return -1;
+  }
+
   copy_thread(child, current_task);
   child->parent = current_task;
   child->uid = current_task->uid;

@@ -393,11 +393,11 @@ int vfs_readdir(struct file *file, void *ctx,
 int vfs_close(struct file *file) {
   if (!file)
     return -EBADF;
-  if (file->f_op && file->f_op->release && file->f_dentry) {
-    file->f_op->release(file->f_dentry->d_inode, file);
-  }
-  file->f_count.counter--;
-  if (file->f_count.counter <= 0) {
+
+  if (atomic_dec_and_test(&file->f_count)) {
+    if (file->f_op && file->f_op->release && file->f_dentry) {
+      file->f_op->release(file->f_dentry->d_inode, file);
+    }
     kfree(file);
   }
   return 0;

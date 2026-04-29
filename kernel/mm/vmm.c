@@ -395,6 +395,10 @@ struct mm_struct *vmm_create_address_space(void)
     mm->vma_list = NULL;
     mm->total_vm = 0;
     mm->users.counter = 1;
+    mm->start_brk = 0x10000000UL;
+    mm->brk = mm->start_brk;
+    mm->mmap_base = mm->start_brk + 0x02000000UL;
+    mm->mmap_current = mm->mmap_base;
     
     /* Copy kernel mappings (upper half) */
     for (int i = VMM_ENTRIES / 2; i < VMM_ENTRIES; i++) {
@@ -533,32 +537,89 @@ struct vm_area *vmm_find_vma(struct mm_struct *mm, virt_addr_t addr)
     return NULL;
 }
 
+static void vmm_remove_vma_range(struct mm_struct *mm, virt_addr_t start, virt_addr_t end)
+{
+    struct vm_area **link = &mm->vma_list;
+
+    while (*link) {
+        struct vm_area *vma = *link;
+        if (vma->start == start && vma->end == end) {
+            *link = vma->next;
+            if (mm->total_vm >= end - start) {
+                mm->total_vm -= end - start;
+            }
+            return;
+        }
+        link = &vma->next;
+    }
+}
+
 /* Map user address range with physical pages */
 int vmm_map_user_range(struct mm_struct *mm, virt_addr_t vaddr, size_t size, uint32_t flags)
 {
-    if (!mm) return -1;
+    if (!mm || size == 0) return -1;
     
     virt_addr_t end = (vaddr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     vaddr = vaddr & ~(PAGE_SIZE - 1);
     
     /* Add VMA */
-    vmm_add_vma(mm, vaddr, end, flags);
+    if (vmm_add_vma(mm, vaddr, end, flags) != 0) {
+        return -1;
+    }
     
     /* Allocate and map pages */
     for (virt_addr_t addr = vaddr; addr < end; addr += PAGE_SIZE) {
         phys_addr_t paddr = pmm_alloc_page();
         if (!paddr) {
             printk(KERN_ERR "vmm_map_user_range: out of memory\n");
+            vmm_unmap_user_range(mm, vaddr, end - vaddr);
             return -1;
         }
-        
+        uint8_t *page = (uint8_t *)paddr;
+        for (size_t i = 0; i < PAGE_SIZE; i++) {
+            page[i] = 0;
+        }
+
         int ret = vmm_map_user_page(mm, addr, paddr, flags);
         if (ret != 0) {
             pmm_free_page(paddr);
+            vmm_unmap_user_range(mm, vaddr, end - vaddr);
             return ret;
         }
     }
     
+    return 0;
+}
+
+int vmm_unmap_user_range(struct mm_struct *mm, virt_addr_t vaddr, size_t size)
+{
+    if (!mm || !mm->pgd || size == 0) return -1;
+
+    virt_addr_t start = vaddr & ~(PAGE_SIZE - 1);
+    virt_addr_t end = (vaddr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    for (virt_addr_t addr = start; addr < end; addr += PAGE_SIZE) {
+        int l0_idx = (addr >> VMM_LEVEL0_SHIFT) & (VMM_ENTRIES - 1);
+        int l1_idx = (addr >> VMM_LEVEL1_SHIFT) & (VMM_ENTRIES - 1);
+        int l2_idx = (addr >> VMM_LEVEL2_SHIFT) & (VMM_ENTRIES - 1);
+        int l3_idx = (addr >> VMM_LEVEL3_SHIFT) & (VMM_ENTRIES - 1);
+
+        uint64_t *l0 = mm->pgd;
+        if (!(l0[l0_idx] & PTE_VALID)) continue;
+        uint64_t *l1 = (uint64_t *)(l0[l0_idx] & PTE_ADDR_MASK);
+        if (!(l1[l1_idx] & PTE_VALID)) continue;
+        uint64_t *l2 = (uint64_t *)(l1[l1_idx] & PTE_ADDR_MASK);
+        if (!(l2[l2_idx] & PTE_VALID)) continue;
+        uint64_t *l3 = (uint64_t *)(l2[l2_idx] & PTE_ADDR_MASK);
+        if (!(l3[l3_idx] & PTE_VALID)) continue;
+
+        phys_addr_t paddr = l3[l3_idx] & PTE_ADDR_MASK;
+        l3[l3_idx] = 0;
+        pmm_free_page(paddr);
+    }
+
+    vmm_remove_vma_range(mm, start, end);
+    vmm_flush_tlb();
     return 0;
 }
 
